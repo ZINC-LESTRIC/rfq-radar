@@ -12,10 +12,11 @@
  * Pipeline:
  *   1. LLM expands product → { exact[], family[], category[], cpvPrefixes[] }
  *   2. Keyword + CPV filter (skipped entirely if < 500 notices loaded)
- *   3. LLM scores notices 0-100 in batches of 8 (4s between batches)
- *   4. Failed batches → status "failed", not cached; one automatic retry pass at end
- *   5. scored-all.json = all (status scored|failed); matches.json = tier strong + check
- *   6. Cache only successfully scored notices (keyed by PROMPT_VERSION)
+ *   3. LLM scores notices from title/description only (no CPV interpretation)
+ *   4. Programmatic strong-tier guard: exact/family keyword must appear in text
+ *   5. Failed batches → status "failed", not cached; one automatic retry at end
+ *   6. scored-all.json + matches.json (tier strong + check)
+ *   7. Cache keyed by PROMPT_VERSION
  */
 
 'use strict';
@@ -31,8 +32,8 @@ const MATCHES_FILE = path.join(__dirname, 'matches.json');
 const SCORED_ALL_FILE = path.join(__dirname, 'scored-all.json');
 const CACHE_FILE = path.join(__dirname, 'cache.json');
 
-// Bump this when the scoring prompt/rules change so old cache entries are ignored
-const PROMPT_VERSION = 'v3-calibrated-2026-09';
+// Bump when scoring prompt/rules change so old cache entries are ignored
+const PROMPT_VERSION = 'v4-no-cpv-hallucinate-2026-09';
 
 const API_KEY = process.env.LLM_API_KEY;
 const MODEL = process.env.LLM_MODEL;
@@ -100,7 +101,6 @@ function saveJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
-/** Cache key includes PROMPT_VERSION so old scores from previous prompts are not reused */
 function cacheKey(productDesc, noticeUrl) {
   return `${PROMPT_VERSION}||${normalize(productDesc)}||${noticeUrl}`;
 }
@@ -112,35 +112,61 @@ function assignTier(score) {
   return undefined;
 }
 
-function flattenTiers(tiers) {
+function flattenTiers(tiers, keys) {
   const all = [];
-  for (const key of ['exact', 'family', 'category']) {
+  for (const key of keys) {
     if (Array.isArray(tiers[key])) all.push(...tiers[key]);
   }
   return [...new Set(all.map(k => String(k).trim()).filter(k => k.length >= 2))];
 }
 
+/** True if any exact/family keyword literally appears in title or description */
+function hasExactOrFamilyHit(notice, tiers) {
+  const haystack = normalize(`${notice.title || ''} ${notice.description || ''}`);
+  const kws = flattenTiers(tiers, ['exact', 'family']).map(normalize);
+  return kws.some(kw => kw.length >= 2 && haystack.includes(kw));
+}
+
+/** Cap score at 69 / tier check unless exact|family keyword is present */
+function applyStrongGuard(notice, score, reason, tiers) {
+  let finalScore = score;
+  let tier = assignTier(finalScore);
+  let finalReason = reason;
+
+  if (tier === 'strong' && !hasExactOrFamilyHit(notice, tiers)) {
+    finalScore = Math.min(finalScore, 69);
+    tier = 'check';
+    finalReason = `${reason} [capped: no exact/family keyword in title/description]`;
+  }
+
+  return { score: finalScore, reason: finalReason, tier };
+}
+
 // ---------------------------------------------------------------------------
-// LLM client – Retry-After on 429, exponential backoff otherwise
+// LLM client – Retry-After on 429, exponential backoff
 // ---------------------------------------------------------------------------
 
-async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
+async function llmChat(messages, { temperature = 0.2, maxTokens = 2048, forceJson = true } = {}) {
   let lastErr;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
+      const body = {
+        model: MODEL,
+        messages,
+        temperature,
+        max_tokens: maxTokens
+      };
+      if (forceJson) {
+        body.response_format = { type: 'json_object' };
+      }
+
       const res = await fetch(`${BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${API_KEY}`
         },
-        body: JSON.stringify({
-          model: MODEL,
-          messages,
-          temperature,
-          max_tokens: maxTokens,
-          response_format: { type: 'json_object' }
-        })
+        body: JSON.stringify(body)
       });
 
       if (res.status === 429 || res.status >= 500) {
@@ -149,11 +175,7 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
           const ra = res.headers.get('retry-after');
           if (ra) {
             const secs = Number(ra);
-            if (!Number.isNaN(secs) && secs > 0) {
-              delay = Math.max(delay, secs * 1000);
-            } else {
-              delay = Math.max(delay, 4000);
-            }
+            delay = !Number.isNaN(secs) && secs > 0 ? Math.max(delay, secs * 1000) : Math.max(delay, 4000);
           } else {
             delay = Math.max(delay, 4000);
           }
@@ -163,9 +185,24 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
         continue;
       }
 
+      // 400 often = json_validate_failed; retry without response_format or with shorter prompt upstream
+      if (res.status === 400) {
+        const bodyText = await res.text();
+        lastErr = new Error(`LLM HTTP 400: ${bodyText.slice(0, 300)}`);
+        if (attempt < MAX_RETRIES - 1) {
+          const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+          console.warn(`  LLM 400 – retry in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          await sleep(delay);
+          // On next attempts, drop strict json_object mode if it caused validate failures
+          forceJson = false;
+          continue;
+        }
+        throw lastErr;
+      }
+
       if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`LLM HTTP ${res.status}: ${body.slice(0, 400)}`);
+        const text = await res.text();
+        throw new Error(`LLM HTTP ${res.status}: ${text.slice(0, 400)}`);
       }
 
       const data = await res.json();
@@ -174,10 +211,12 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
       return content;
     } catch (err) {
       lastErr = err;
-      if (attempt < MAX_RETRIES - 1) {
+      if (attempt < MAX_RETRIES - 1 && !String(err.message).includes('HTTP 400')) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt);
         console.warn(`  LLM error: ${err.message} – retry in ${delay}ms`);
         await sleep(delay);
+      } else if (attempt >= MAX_RETRIES - 1) {
+        break;
       }
     }
   }
@@ -185,71 +224,86 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
 }
 
 function parseJsonStrict(text) {
-  let cleaned = text.trim();
+  let cleaned = String(text).trim();
+  // Strip markdown fences
   if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/s, '');
+  }
+  // Extract outermost JSON object if extra prose slipped in
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) {
+    cleaned = cleaned.slice(start, end + 1);
   }
   return JSON.parse(cleaned);
 }
 
 // ---------------------------------------------------------------------------
-// Step 1 – Tiered keyword + CPV expansion
+// Step 1 – Keyword expansion (robust, flat schema, up to 5 attempts)
 // ---------------------------------------------------------------------------
 
 async function expandKeywords(productDesc) {
   console.log('\n[1/4] Expanding product into tiered keywords + CPV prefixes…');
 
-  const system = `You are a procurement keyword expert helping a Pakistani exporter find EU public tenders on TED.
+  const shortSystem = `Return ONLY a JSON object with four arrays of short strings:
+{"exact":[],"family":[],"category":[],"cpvPrefixes":[]}
+exact = product synonyms + stems + translations DE/FR/ES/IT/PL/NL/CS/RO
+family = product family terms + translations
+category = generic tender wording (sports equipment, Sportgeräte, etc.) + translations
+cpvPrefixes = 3-6 four-digit CPV prefixes as strings e.g. "3741"
+8-12 terms per keyword array. No markdown.`;
 
-Given a product description, return ONLY valid JSON with this exact shape:
-{
-  "exact": ["..."],
-  "family": ["..."],
-  "category": ["..."],
-  "cpvPrefixes": ["3741", "3742"]
-}
+  const longSystem = `You expand a product into search keywords for EU TED tenders.
+Reply with ONLY this JSON (no markdown):
+{"exact":["..."],"family":["..."],"category":["..."],"cpvPrefixes":["3741"]}
+- exact: product + synonyms + single-word stems + DE FR ES IT PL NL CS RO
+- family: broader family (ball games, team sports goods) + translations
+- category: buyer wording (sports equipment, Sportgeräte, matériels sportifs) + stems
+- cpvPrefixes: 3-6 four-digit prefixes only
+Aim 8-12 terms per list.`;
 
-Rules for keywords:
-- exact: the product itself, close synonyms, size/material variants (English + DE/FR/ES/IT/PL/NL/CS/RO). Include single-word stems (e.g. "football", "ball", "leather").
-- family: broader product family (e.g. ball games, team sports goods, sports balls). Same languages + stems.
-- category: generic buyer/tender wording (e.g. sports equipment, Sportgeräte, matériels sportifs, gym equipment, school sports supplies, sporting goods). Same languages + short stems like "sport", "equip".
-- Aim for 8-15 terms per tier. Mix phrases and single words. No duplicates across the whole response if possible.
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const useShort = attempt >= 2;
+      const system = useShort ? shortSystem : longSystem;
+      const raw = await llmChat([
+        { role: 'system', content: system },
+        { role: 'user', content: `Product: ${productDesc}` }
+      ], {
+        temperature: 0.3,
+        maxTokens: useShort ? 900 : 1500,
+        forceJson: attempt < 3 // drop json mode on later retries
+      });
 
-Rules for cpvPrefixes:
-- 3 to 6 likely CPV code PREFIXES (first 4 digits only, as strings).
-- Examples: sports goods → "3741","3742"; surgical instruments → "3316","3314"; clothing → "1821","1831".
+      const parsed = parseJsonStrict(raw);
 
-Return ONLY the JSON object. No markdown, no commentary.`;
+      for (const key of ['exact', 'family', 'category']) {
+        if (!Array.isArray(parsed[key])) parsed[key] = [];
+        parsed[key] = parsed[key].map(k => String(k).trim()).filter(k => k.length >= 2);
+      }
+      if (!Array.isArray(parsed.cpvPrefixes)) parsed.cpvPrefixes = [];
+      parsed.cpvPrefixes = parsed.cpvPrefixes
+        .map(p => String(p).replace(/\D/g, '').slice(0, 4))
+        .filter(p => p.length === 4);
 
-  const user = `Product: ${productDesc}`;
+      const totalKw = flattenTiers(parsed, ['exact', 'family', 'category']).length;
+      if (totalKw < 5) {
+        throw new Error(`Too few keywords (${totalKw})`);
+      }
 
-  const raw = await llmChat([
-    { role: 'system', content: system },
-    { role: 'user', content: user }
-  ], { temperature: 0.35, maxTokens: 1500 });
-
-  const parsed = parseJsonStrict(raw);
-
-  for (const key of ['exact', 'family', 'category']) {
-    if (!Array.isArray(parsed[key])) parsed[key] = [];
-    parsed[key] = parsed[key].map(k => String(k).trim()).filter(k => k.length >= 2);
+      console.log(`  exact   (${parsed.exact.length}): ${parsed.exact.slice(0, 6).join(', ')}…`);
+      console.log(`  family  (${parsed.family.length}): ${parsed.family.slice(0, 6).join(', ')}…`);
+      console.log(`  category(${parsed.category.length}): ${parsed.category.slice(0, 6).join(', ')}…`);
+      console.log(`  CPV prefixes: ${parsed.cpvPrefixes.join(', ') || '(none)'}`);
+      return parsed;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`  Keyword expand attempt ${attempt + 1}/${MAX_RETRIES} failed: ${err.message}`);
+      if (attempt < MAX_RETRIES - 1) await sleep(BASE_DELAY_MS * Math.pow(2, attempt));
+    }
   }
-  if (!Array.isArray(parsed.cpvPrefixes)) parsed.cpvPrefixes = [];
-  parsed.cpvPrefixes = parsed.cpvPrefixes
-    .map(p => String(p).replace(/\D/g, '').slice(0, 4))
-    .filter(p => p.length === 4);
-
-  const totalKw = flattenTiers(parsed).length;
-  if (totalKw < 5) {
-    throw new Error(`Too few keywords from LLM (${totalKw}): ${raw.slice(0, 400)}`);
-  }
-
-  console.log(`  exact   (${parsed.exact.length}): ${parsed.exact.slice(0, 6).join(', ')}…`);
-  console.log(`  family  (${parsed.family.length}): ${parsed.family.slice(0, 6).join(', ')}…`);
-  console.log(`  category(${parsed.category.length}): ${parsed.category.slice(0, 6).join(', ')}…`);
-  console.log(`  CPV prefixes: ${parsed.cpvPrefixes.join(', ') || '(none)'}`);
-
-  return parsed;
+  throw lastErr || new Error('Keyword expansion failed');
 }
 
 // ---------------------------------------------------------------------------
@@ -263,13 +317,12 @@ function filterNotices(notices, tiers) {
   }
 
   console.log('\n[2/4] Filtering by tiered keywords + CPV prefixes…');
-  const keywords = flattenTiers(tiers).map(normalize);
+  const keywords = flattenTiers(tiers, ['exact', 'family', 'category']).map(normalize);
   const prefixes = tiers.cpvPrefixes || [];
 
   const matched = notices.filter(n => {
     const haystack = normalize(`${n.title || ''} ${n.description || ''}`);
-    const kwHit = keywords.some(kw => haystack.includes(kw));
-    if (kwHit) return true;
+    if (keywords.some(kw => haystack.includes(kw))) return true;
 
     if (prefixes.length && n.cpv) {
       const codes = String(n.cpv).split(/[,\s]+/).map(c => c.replace(/\D/g, ''));
@@ -283,37 +336,43 @@ function filterNotices(notices, tiers) {
 }
 
 // ---------------------------------------------------------------------------
-// Scoring prompt (v3 calibrated)
+// Scoring prompt – title/description only, no CPV interpretation
 // ---------------------------------------------------------------------------
 
 const SCORING_SYSTEM = `You are an expert EU public-procurement advisor helping a Pakistani manufacturer/exporter.
 
-For each tender notice, score 0-100: how well does this tender match the product the manufacturer makes?
+For each tender notice, score 0-100 based ONLY on the title and description text provided.
 
-Scoring rules (follow exactly):
-- 75-100: tender explicitly names the product or a directly matching product line (e.g. footballs, balls, team sports balls, surgical scissors).
-- 50-70: generic category tender that plausibly covers the product (e.g. "Sports goods and equipment", "Field and court sports equipment", school sports supplies, "surgical instruments") AND the description does not rule the product out. Do NOT require the product to be explicitly listed for this band.
-- 25-45: same broad sector but the product is a stretch (playground equipment, fitness-only, therapy equipment, teaching aids, advertising items, clothing/kits only).
+CRITICAL:
+- Do NOT interpret, expand, or reason about CPV codes. Ignore any CPV field if present. CPV numbers in the data are for reference only and must not influence your score or reason.
+- Judge solely from the title and description wording.
+
+Scoring rules:
+- 75-100: title or description explicitly names the product or a directly matching product line (e.g. footballs, balls, team sports balls, surgical scissors).
+- 50-70: generic category wording that plausibly covers the product (e.g. "Sports goods and equipment", "Field and court sports equipment", school sports supplies, "surgical instruments") and does not rule the product out. The product need not be listed by name.
+- 25-45: same broad sector but a stretch (playground equipment, fitness-only, therapy, teaching aids, advertising items, clothing/kits only).
 - 0-20: construction, services, unrelated goods.
 
+For the "reason" field: quote the exact short phrase from the title or description that supports the score, then add a brief note. If nothing relevant is written, set reason to exactly: no explicit mention
+
 Return ONLY JSON:
-{ "scores": [ { "index": 0, "score": 62, "reason": "one short sentence" }, ... ] }`;
+{ "scores": [ { "index": 0, "score": 62, "reason": "\"sports equipment\" – generic category match" }, ... ] }`;
 
 // ---------------------------------------------------------------------------
-// Score a single batch – cache only successful scores
+// Score a single batch
 // ---------------------------------------------------------------------------
 
-async function scoreBatch(productDesc, batch, cache) {
+async function scoreBatch(productDesc, batch, cache, keywordTiers) {
+  // Intentionally omit cpv from payload so the model cannot hallucinate CPV meanings
   const noticesPayload = batch.map((n, idx) => ({
     index: idx,
     title: n.title || '',
     description: (n.description || '').slice(0, 500),
     country: n.country || '',
-    cpv: n.cpv || '',
     deadline: n.deadline || ''
   }));
 
-  const user = `Product manufactured in Pakistan: ${productDesc}\n\nNotices to score:\n${JSON.stringify(noticesPayload, null, 2)}`;
+  const user = `Product manufactured in Pakistan: ${productDesc}\n\nNotices to score (title + description only):\n${JSON.stringify(noticesPayload, null, 2)}`;
 
   const raw = await llmChat([
     { role: 'system', content: SCORING_SYSTEM },
@@ -329,7 +388,7 @@ async function scoreBatch(productDesc, batch, cache) {
     if (Number.isNaN(idx) || idx < 0 || idx >= batch.length) continue;
     byIndex.set(idx, {
       score: Math.max(0, Math.min(100, Number(s.score) || 0)),
-      reason: String(s.reason || '').slice(0, 220)
+      reason: String(s.reason || 'no explicit mention').slice(0, 280)
     });
   }
 
@@ -342,22 +401,24 @@ async function scoreBatch(productDesc, batch, cache) {
     const notice = batch[idx];
     if (byIndex.has(idx)) {
       const scored = byIndex.get(idx);
-      const tier = assignTier(scored.score);
+      const guarded = applyStrongGuard(notice, scored.score, scored.reason, keywordTiers);
+
       const key = cacheKey(productDesc, notice.noticeUrl || notice.title);
       cache[key] = {
-        score: scored.score,
-        reason: scored.reason,
-        tier: tier || null,
+        score: guarded.score,
+        reason: guarded.reason,
+        tier: guarded.tier || null,
         promptVersion: PROMPT_VERSION,
         scoredAt: new Date().toISOString()
       };
+
       const row = {
         ...notice,
-        score: scored.score,
-        reason: scored.reason,
+        score: guarded.score,
+        reason: guarded.reason,
         status: 'scored'
       };
-      if (tier) row.tier = tier;
+      if (guarded.tier) row.tier = guarded.tier;
       rows.push(row);
     } else {
       rows.push({
@@ -377,7 +438,7 @@ async function scoreBatch(productDesc, batch, cache) {
 // Step 3 – Score all notices; retry failures once at the end
 // ---------------------------------------------------------------------------
 
-async function scoreNotices(productDesc, notices, cache) {
+async function scoreNotices(productDesc, notices, cache, keywordTiers) {
   console.log(`\n[3/4] Scoring ${notices.length} notices with LLM (batches of ${BATCH_SIZE}, ${INTER_BATCH_DELAY_MS / 1000}s between batches)…`);
   console.log(`  Prompt version: ${PROMPT_VERSION}`);
 
@@ -388,21 +449,22 @@ async function scoreNotices(productDesc, notices, cache) {
   for (const n of notices) {
     const key = cacheKey(productDesc, n.noticeUrl || n.title);
     if (cache[key] && typeof cache[key].score === 'number') {
-      const tier = assignTier(cache[key].score);
+      // Re-apply strong guard in case tiers changed relative to cached score
+      const guarded = applyStrongGuard(n, cache[key].score, cache[key].reason, keywordTiers);
       const row = {
         ...n,
-        score: cache[key].score,
-        reason: cache[key].reason,
+        score: guarded.score,
+        reason: guarded.reason,
         status: 'scored'
       };
-      if (tier) row.tier = tier;
+      if (guarded.tier) row.tier = guarded.tier;
       results.push(row);
     } else {
       toScore.push(n);
     }
   }
 
-  console.log(`  Cached (successful only, this prompt version): ${results.length} | Need scoring: ${toScore.length}`);
+  console.log(`  Cached (this prompt version): ${results.length} | Need scoring: ${toScore.length}`);
 
   async function runBatches(list, label) {
     for (let i = 0; i < list.length; i += BATCH_SIZE) {
@@ -412,13 +474,10 @@ async function scoreNotices(productDesc, notices, cache) {
       console.log(`  ${label} batch ${batchNum}/${totalBatches} (${batch.length} notices)…`);
 
       try {
-        const rows = await scoreBatch(productDesc, batch, cache);
+        const rows = await scoreBatch(productDesc, batch, cache, keywordTiers);
         for (const row of rows) {
-          if (row.status === 'scored') {
-            results.push(row);
-          } else {
-            failed.push(row);
-          }
+          if (row.status === 'scored') results.push(row);
+          else failed.push(row);
         }
       } catch (err) {
         console.error(`  Batch ${batchNum} failed after retries: ${err.message}`);
@@ -492,7 +551,7 @@ function outputResults(scored) {
   const check = scoredOk.filter(n => n.tier === 'check').sort((a, b) => b.score - a.score);
   const matches = [...strong, ...check];
 
-  console.log(`\n=== STRONG (score >= 70) — ${strong.length} ===`);
+  console.log(`\n=== STRONG (score >= 70 + exact/family keyword hit) — ${strong.length} ===`);
   if (strong.length === 0) {
     console.log('(none)');
   } else {
@@ -572,8 +631,8 @@ async function main() {
 
   const cache = loadJson(CACHE_FILE, {});
 
-  const tiers = await expandKeywords(product);
-  const filtered = filterNotices(notices, tiers);
+  const keywordTiers = await expandKeywords(product);
+  const filtered = filterNotices(notices, keywordTiers);
 
   if (filtered.length === 0) {
     console.log('\nNo notices to score. Saving empty outputs.');
@@ -584,7 +643,7 @@ async function main() {
 
   console.log(`\n→ ${filtered.length} notices will be sent to LLM scoring`);
 
-  const scored = await scoreNotices(product, filtered, cache);
+  const scored = await scoreNotices(product, filtered, cache, keywordTiers);
   outputResults(scored);
 }
 
