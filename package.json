@@ -1,0 +1,23 @@
+{
+  "name": "rfq-radar",
+  "version": "1.0.0",
+  "description": "TED EU public tender notices fetcher for sports goods and surgical instruments",
+  "main": "ted-fetch.js",
+  "scripts": {
+    "start": "node ted-fetch.js",
+    "fetch": "node ted-fetch.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "ted",
+    "eu",
+    "tenders",
+    "procurement",
+    "cpv"
+  ],
+  "author": "ZINC-LESTRIC",
+  "license": "MIT",
+  "dependencies": {}
+}

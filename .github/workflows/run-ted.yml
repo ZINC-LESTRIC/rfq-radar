@@ -1,0 +1,28 @@
+name: Run TED Fetcher
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch-tenders:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run TED fetcher
+        run: node ted-fetch.js
+
+      - name: Upload results.json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ted-results
+          path: results.json
+          if-no-files-found: warn
+          retention-days: 7
