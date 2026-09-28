@@ -12,10 +12,10 @@
  * Pipeline:
  *   1. LLM expands product → { exact[], family[], category[], cpvPrefixes[] }
  *   2. Keyword + CPV filter (skipped entirely if < 500 notices loaded)
- *   3. LLM scores every filtered notice 0-100 in batches of 10
- *   4. scored-all.json = all scores; matches.json = score >= 60
- *   5. Cache scores in cache.json
- *   6. Retry + exponential backoff on rate limits
+ *   3. LLM scores notices 0-100 in batches of 8 (4s between batches)
+ *   4. Failed batches → status "failed", not cached; one automatic retry pass at end
+ *   5. scored-all.json = all (status scored|failed); matches.json = score >= 60
+ *   6. Cache only successfully scored notices
  */
 
 'use strict';
@@ -36,10 +36,11 @@ const MODEL = process.env.LLM_MODEL;
 const BASE_URL = resolveBaseUrl(process.env.LLM_BASE_URL, MODEL);
 
 const SCORE_THRESHOLD = 60;
-const BATCH_SIZE = 10;
+const BATCH_SIZE = 8;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1500;
-const SKIP_FILTER_BELOW = 500; // if fewer notices, score everything
+const INTER_BATCH_DELAY_MS = 4000;
+const SKIP_FILTER_BELOW = 500;
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -79,7 +80,6 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-/** Strip diacritics for accent-insensitive matching */
 function normalize(str) {
   return String(str || '')
     .normalize('NFD')
@@ -111,7 +111,7 @@ function flattenTiers(tiers) {
 }
 
 // ---------------------------------------------------------------------------
-// LLM client with retry + backoff
+// LLM client – Retry-After on 429, exponential backoff otherwise
 // ---------------------------------------------------------------------------
 
 async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
@@ -134,7 +134,21 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
       });
 
       if (res.status === 429 || res.status >= 500) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        let delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        if (res.status === 429) {
+          const ra = res.headers.get('retry-after');
+          if (ra) {
+            const secs = Number(ra);
+            if (!Number.isNaN(secs) && secs > 0) {
+              delay = Math.max(delay, secs * 1000);
+            } else {
+              // HTTP-date form – fall back to at least 4s
+              delay = Math.max(delay, 4000);
+            }
+          } else {
+            delay = Math.max(delay, 4000);
+          }
+        }
         console.warn(`  LLM ${res.status} – retry in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
         await sleep(delay);
         continue;
@@ -151,6 +165,7 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
       return content;
     } catch (err) {
       lastErr = err;
+      // Don't retry non-HTTP parse errors beyond the loop; still backoff
       if (attempt < MAX_RETRIES - 1) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt);
         console.warn(`  LLM error: ${err.message} – retry in ${delay}ms`);
@@ -207,7 +222,6 @@ Return ONLY the JSON object. No markdown, no commentary.`;
 
   const parsed = parseJsonStrict(raw);
 
-  // Validate tiers
   for (const key of ['exact', 'family', 'category']) {
     if (!Array.isArray(parsed[key])) parsed[key] = [];
     parsed[key] = parsed[key].map(k => String(k).trim()).filter(k => k.length >= 2);
@@ -261,98 +275,174 @@ function filterNotices(notices, tiers) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3 – LLM relevance scoring (batches of 10) with cache
+// Scoring prompt (tightened)
+// ---------------------------------------------------------------------------
+
+const SCORING_SYSTEM = `You are an expert EU public-procurement advisor helping a Pakistani manufacturer/exporter.
+
+For each tender notice, score 0-100: how well does this tender match the exact product the manufacturer makes?
+
+Scoring rules (follow strictly):
+- 75-100: ONLY if the tender text explicitly covers the exact product or a clearly matching product line (e.g. footballs, match balls, team sports balls named in the title/description).
+- 55-70: generic category tenders that plausibly include the product (e.g. "sports equipment", "Sportgeräte", "matériels sportifs") BUT only when the category is the right one. Do NOT give 60+ just because something "could include" the product — the tender text itself must list sports balls, team sports equipment, or an equivalent clear product line for 60+.
+- Below 40: playground equipment, construction works, teaching aids, advertising items, furniture, pure services, IT, medical devices unrelated to the product, or any stretch interpretation.
+- 40-54: weak / tangential only.
+
+Return ONLY JSON:
+{ "scores": [ { "index": 0, "score": 65, "reason": "one short sentence" }, ... ] }`;
+
+// ---------------------------------------------------------------------------
+// Score a single batch → { ok: true, rows } | { ok: false, error }
+// Cache only on success.
+// ---------------------------------------------------------------------------
+
+async function scoreBatch(productDesc, batch, cache) {
+  const noticesPayload = batch.map((n, idx) => ({
+    index: idx,
+    title: n.title || '',
+    description: (n.description || '').slice(0, 500),
+    country: n.country || '',
+    cpv: n.cpv || '',
+    deadline: n.deadline || ''
+  }));
+
+  const user = `Product manufactured in Pakistan: ${productDesc}\n\nNotices to score:\n${JSON.stringify(noticesPayload, null, 2)}`;
+
+  const raw = await llmChat([
+    { role: 'system', content: SCORING_SYSTEM },
+    { role: 'user', content: user }
+  ], { temperature: 0.15, maxTokens: 2048 });
+
+  const parsed = parseJsonStrict(raw);
+  const scores = Array.isArray(parsed.scores) ? parsed.scores : [];
+
+  const byIndex = new Map();
+  for (const s of scores) {
+    const idx = Number(s.index);
+    if (Number.isNaN(idx) || idx < 0 || idx >= batch.length) continue;
+    byIndex.set(idx, {
+      score: Math.max(0, Math.min(100, Number(s.score) || 0)),
+      reason: String(s.reason || '').slice(0, 220)
+    });
+  }
+
+  // Require at least half the batch scored, otherwise treat as failure
+  if (byIndex.size < Math.ceil(batch.length / 2)) {
+    throw new Error(`LLM returned only ${byIndex.size}/${batch.length} scores`);
+  }
+
+  const rows = [];
+  for (let idx = 0; idx < batch.length; idx++) {
+    const notice = batch[idx];
+    if (byIndex.has(idx)) {
+      const scored = byIndex.get(idx);
+      const key = cacheKey(productDesc, notice.noticeUrl || notice.title);
+      cache[key] = {
+        score: scored.score,
+        reason: scored.reason,
+        scoredAt: new Date().toISOString()
+      };
+      rows.push({
+        ...notice,
+        score: scored.score,
+        reason: scored.reason,
+        status: 'scored'
+      });
+    } else {
+      // Missing index → mark failed (do not cache)
+      rows.push({
+        ...notice,
+        score: null,
+        reason: 'LLM did not return a score for this notice',
+        status: 'failed'
+      });
+    }
+  }
+
+  saveJson(CACHE_FILE, cache);
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Step 3 – Score all notices; retry failures once at the end
 // ---------------------------------------------------------------------------
 
 async function scoreNotices(productDesc, notices, cache) {
-  console.log(`\n[3/4] Scoring ${notices.length} notices with LLM (batches of ${BATCH_SIZE})…`);
+  console.log(`\n[3/4] Scoring ${notices.length} notices with LLM (batches of ${BATCH_SIZE}, ${INTER_BATCH_DELAY_MS / 1000}s between batches)…`);
 
   const results = [];
   const toScore = [];
+  const failed = [];
 
   for (const n of notices) {
     const key = cacheKey(productDesc, n.noticeUrl || n.title);
     if (cache[key] && typeof cache[key].score === 'number') {
-      results.push({ ...n, score: cache[key].score, reason: cache[key].reason });
+      results.push({
+        ...n,
+        score: cache[key].score,
+        reason: cache[key].reason,
+        status: 'scored'
+      });
     } else {
       toScore.push(n);
     }
   }
 
-  console.log(`  Cached: ${results.length} | Need scoring: ${toScore.length}`);
+  console.log(`  Cached (successful only): ${results.length} | Need scoring: ${toScore.length}`);
 
-  for (let i = 0; i < toScore.length; i += BATCH_SIZE) {
-    const batch = toScore.slice(i, i + BATCH_SIZE);
-    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    const totalBatches = Math.ceil(toScore.length / BATCH_SIZE);
-    console.log(`  Scoring batch ${batchNum}/${totalBatches} (${batch.length} notices)…`);
+  async function runBatches(list, label) {
+    for (let i = 0; i < list.length; i += BATCH_SIZE) {
+      const batch = list.slice(i, i + BATCH_SIZE);
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(list.length / BATCH_SIZE);
+      console.log(`  ${label} batch ${batchNum}/${totalBatches} (${batch.length} notices)…`);
 
-    const system = `You are an expert EU public-procurement advisor helping a Pakistani manufacturer/exporter.
-
-For each tender notice, score 0-100: could this manufacturer realistically supply items covered by the tender?
-
-Scoring guide:
-- 80-100: tender is clearly for this product or a very close match.
-- 60-80: generic category tender that PLASIBLY includes the product (e.g. "sports equipment" / "Sportgeräte" for a football maker; "surgical instruments" for scissors). These SHOULD score 60-80.
-- 40-59: weak / tangential link.
-- 0-30: construction works, pure services, IT, unrelated goods – must score below 30.
-
-Return ONLY JSON:
-{ "scores": [ { "index": 0, "score": 75, "reason": "one short sentence" }, ... ] }
-
-Be strict on unrelated categories, generous on generic category tenders that could include the product.`;
-
-    const noticesPayload = batch.map((n, idx) => ({
-      index: idx,
-      title: n.title || '',
-      description: (n.description || '').slice(0, 500),
-      country: n.country || '',
-      cpv: n.cpv || '',
-      deadline: n.deadline || ''
-    }));
-
-    const user = `Product manufactured in Pakistan: ${productDesc}\n\nNotices to score:\n${JSON.stringify(noticesPayload, null, 2)}`;
-
-    try {
-      const raw = await llmChat([
-        { role: 'system', content: system },
-        { role: 'user', content: user }
-      ], { temperature: 0.15, maxTokens: 2048 });
-
-      const parsed = parseJsonStrict(raw);
-      const scores = Array.isArray(parsed.scores) ? parsed.scores : [];
-
-      // Map by index; fill gaps with 0 if LLM skipped some
-      const byIndex = new Map();
-      for (const s of scores) {
-        const idx = Number(s.index);
-        if (Number.isNaN(idx) || idx < 0 || idx >= batch.length) continue;
-        byIndex.set(idx, {
-          score: Math.max(0, Math.min(100, Number(s.score) || 0)),
-          reason: String(s.reason || '').slice(0, 220)
-        });
+      try {
+        const rows = await scoreBatch(productDesc, batch, cache);
+        for (const row of rows) {
+          if (row.status === 'scored') {
+            results.push(row);
+          } else {
+            failed.push(row);
+          }
+        }
+      } catch (err) {
+        console.error(`  Batch ${batchNum} failed after retries: ${err.message}`);
+        for (const notice of batch) {
+          // status failed, score null — do NOT cache
+          failed.push({
+            ...notice,
+            score: null,
+            reason: `Scoring failed: ${err.message.slice(0, 120)}`,
+            status: 'failed'
+          });
+        }
       }
 
-      for (let idx = 0; idx < batch.length; idx++) {
-        const notice = batch[idx];
-        const scored = byIndex.get(idx) || { score: 0, reason: 'LLM did not return a score' };
-        const key = cacheKey(productDesc, notice.noticeUrl || notice.title);
-        cache[key] = { score: scored.score, reason: scored.reason, scoredAt: new Date().toISOString() };
-        results.push({ ...notice, score: scored.score, reason: scored.reason });
-      }
-
-      saveJson(CACHE_FILE, cache);
-    } catch (err) {
-      console.error(`  Batch ${batchNum} failed: ${err.message}`);
-      // Still record failed notices so they appear in scored-all
-      for (const notice of batch) {
-        results.push({ ...notice, score: 0, reason: `Scoring failed: ${err.message.slice(0, 80)}` });
+      if (i + BATCH_SIZE < list.length) {
+        console.log(`  Waiting ${INTER_BATCH_DELAY_MS / 1000}s before next batch…`);
+        await sleep(INTER_BATCH_DELAY_MS);
       }
     }
-
-    if (i + BATCH_SIZE < toScore.length) await sleep(800);
   }
 
+  await runBatches(toScore, 'Scoring');
+
+  // One automatic retry pass for all failed notices
+  if (failed.length > 0) {
+    console.log(`\n  Retrying ${failed.length} failed notices once…`);
+    await sleep(INTER_BATCH_DELAY_MS);
+    const retryList = failed.map(n => {
+      // strip previous failure fields before re-scoring
+      const { score, reason, status, ...rest } = n;
+      return rest;
+    });
+    failed.length = 0;
+    await runBatches(retryList, 'Retry');
+  }
+
+  // Anything still in failed stays failed
+  results.push(...failed);
   return results;
 }
 
@@ -363,23 +453,32 @@ Be strict on unrelated categories, generous on generic category tenders that cou
 function outputResults(scored) {
   console.log('\n[4/4] Writing scored-all.json and matches.json…');
 
-  // Sort all by score desc
-  const sorted = [...scored].sort((a, b) => b.score - a.score);
+  const scoredOk = scored.filter(n => n.status === 'scored');
+  const failedCount = scored.filter(n => n.status === 'failed').length;
 
-  // Top 15 table (even if below 60)
-  const top15 = sorted.slice(0, 15);
-  console.log(`\n=== TOP 15 SCORES (of ${sorted.length} scored) ===`);
-  console.table(top15.map(n => ({
-    Score: n.score,
-    Title: (n.title || '').slice(0, 48) + (n.title?.length > 48 ? '…' : ''),
-    Country: n.country,
-    Deadline: n.deadline || '—',
-    Reason: (n.reason || '').slice(0, 55),
-    URL: n.noticeUrl
-  })));
+  // Sort scored first by score desc, failed at the end
+  const sorted = [...scored].sort((a, b) => {
+    if (a.status !== 'scored' && b.status === 'scored') return 1;
+    if (a.status === 'scored' && b.status !== 'scored') return -1;
+    return (b.score || 0) - (a.score || 0);
+  });
 
-  // matches >= 60
-  const matches = sorted.filter(n => n.score >= SCORE_THRESHOLD);
+  const top15 = scoredOk.sort((a, b) => b.score - a.score).slice(0, 15);
+  console.log(`\n=== TOP 15 SCORES (of ${scoredOk.length} successfully scored) ===`);
+  if (top15.length === 0) {
+    console.log('(none scored successfully)');
+  } else {
+    console.table(top15.map(n => ({
+      Score: n.score,
+      Title: (n.title || '').slice(0, 48) + (n.title?.length > 48 ? '…' : ''),
+      Country: n.country,
+      Deadline: n.deadline || '—',
+      Reason: (n.reason || '').slice(0, 55),
+      URL: n.noticeUrl
+    })));
+  }
+
+  const matches = scoredOk.filter(n => n.score >= SCORE_THRESHOLD);
   console.log(`\n=== MATCHES (score >= ${SCORE_THRESHOLD}) — ${matches.length} ===`);
   if (matches.length === 0) {
     console.log('(none above threshold)');
@@ -400,6 +499,7 @@ function outputResults(scored) {
     deadline: n.deadline,
     score: n.score,
     reason: n.reason,
+    status: n.status || 'scored',
     url: n.noticeUrl,
     cpv: n.cpv,
     buyerName: n.buyerName,
@@ -410,9 +510,11 @@ function outputResults(scored) {
   saveJson(MATCHES_FILE, toExport(matches));
 
   console.log(`\n---------- SUMMARY ----------`);
-  console.log(`Notices sent to scoring : ${scored.length}`);
-  console.log(`Score >= ${SCORE_THRESHOLD} (matches)  : ${matches.length}  → matches.json`);
-  console.log(`All scores              : ${sorted.length}  → scored-all.json`);
+  console.log(`Notices sent to scoring     : ${scored.length}`);
+  console.log(`Successfully scored         : ${scoredOk.length}`);
+  console.log(`Failed (status=failed)      : ${failedCount}`);
+  console.log(`Score >= ${SCORE_THRESHOLD} (matches)      : ${matches.length}  → matches.json`);
+  console.log(`All results                 : ${sorted.length}  → scored-all.json`);
 
   return matches;
 }
