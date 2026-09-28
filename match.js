@@ -14,8 +14,8 @@
  *   2. Keyword + CPV filter (skipped entirely if < 500 notices loaded)
  *   3. LLM scores notices 0-100 in batches of 8 (4s between batches)
  *   4. Failed batches → status "failed", not cached; one automatic retry pass at end
- *   5. scored-all.json = all (status scored|failed); matches.json = score >= 60
- *   6. Cache only successfully scored notices
+ *   5. scored-all.json = all (status scored|failed); matches.json = tier strong + check
+ *   6. Cache only successfully scored notices (keyed by PROMPT_VERSION)
  */
 
 'use strict';
@@ -31,11 +31,13 @@ const MATCHES_FILE = path.join(__dirname, 'matches.json');
 const SCORED_ALL_FILE = path.join(__dirname, 'scored-all.json');
 const CACHE_FILE = path.join(__dirname, 'cache.json');
 
+// Bump this when the scoring prompt/rules change so old cache entries are ignored
+const PROMPT_VERSION = 'v3-calibrated-2026-09';
+
 const API_KEY = process.env.LLM_API_KEY;
 const MODEL = process.env.LLM_MODEL;
 const BASE_URL = resolveBaseUrl(process.env.LLM_BASE_URL, MODEL);
 
-const SCORE_THRESHOLD = 60;
 const BATCH_SIZE = 8;
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1500;
@@ -98,8 +100,16 @@ function saveJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
+/** Cache key includes PROMPT_VERSION so old scores from previous prompts are not reused */
 function cacheKey(productDesc, noticeUrl) {
-  return `${normalize(productDesc)}||${noticeUrl}`;
+  return `${PROMPT_VERSION}||${normalize(productDesc)}||${noticeUrl}`;
+}
+
+function assignTier(score) {
+  if (typeof score !== 'number') return undefined;
+  if (score >= 70) return 'strong';
+  if (score >= 40) return 'check';
+  return undefined;
 }
 
 function flattenTiers(tiers) {
@@ -142,7 +152,6 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
             if (!Number.isNaN(secs) && secs > 0) {
               delay = Math.max(delay, secs * 1000);
             } else {
-              // HTTP-date form – fall back to at least 4s
               delay = Math.max(delay, 4000);
             }
           } else {
@@ -165,7 +174,6 @@ async function llmChat(messages, { temperature = 0.2, maxTokens = 2048 } = {}) {
       return content;
     } catch (err) {
       lastErr = err;
-      // Don't retry non-HTTP parse errors beyond the loop; still backoff
       if (attempt < MAX_RETRIES - 1) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt);
         console.warn(`  LLM error: ${err.message} – retry in ${delay}ms`);
@@ -275,25 +283,24 @@ function filterNotices(notices, tiers) {
 }
 
 // ---------------------------------------------------------------------------
-// Scoring prompt (tightened)
+// Scoring prompt (v3 calibrated)
 // ---------------------------------------------------------------------------
 
 const SCORING_SYSTEM = `You are an expert EU public-procurement advisor helping a Pakistani manufacturer/exporter.
 
-For each tender notice, score 0-100: how well does this tender match the exact product the manufacturer makes?
+For each tender notice, score 0-100: how well does this tender match the product the manufacturer makes?
 
-Scoring rules (follow strictly):
-- 75-100: ONLY if the tender text explicitly covers the exact product or a clearly matching product line (e.g. footballs, match balls, team sports balls named in the title/description).
-- 55-70: generic category tenders that plausibly include the product (e.g. "sports equipment", "Sportgeräte", "matériels sportifs") BUT only when the category is the right one. Do NOT give 60+ just because something "could include" the product — the tender text itself must list sports balls, team sports equipment, or an equivalent clear product line for 60+.
-- Below 40: playground equipment, construction works, teaching aids, advertising items, furniture, pure services, IT, medical devices unrelated to the product, or any stretch interpretation.
-- 40-54: weak / tangential only.
+Scoring rules (follow exactly):
+- 75-100: tender explicitly names the product or a directly matching product line (e.g. footballs, balls, team sports balls, surgical scissors).
+- 50-70: generic category tender that plausibly covers the product (e.g. "Sports goods and equipment", "Field and court sports equipment", school sports supplies, "surgical instruments") AND the description does not rule the product out. Do NOT require the product to be explicitly listed for this band.
+- 25-45: same broad sector but the product is a stretch (playground equipment, fitness-only, therapy equipment, teaching aids, advertising items, clothing/kits only).
+- 0-20: construction, services, unrelated goods.
 
 Return ONLY JSON:
-{ "scores": [ { "index": 0, "score": 65, "reason": "one short sentence" }, ... ] }`;
+{ "scores": [ { "index": 0, "score": 62, "reason": "one short sentence" }, ... ] }`;
 
 // ---------------------------------------------------------------------------
-// Score a single batch → { ok: true, rows } | { ok: false, error }
-// Cache only on success.
+// Score a single batch – cache only successful scores
 // ---------------------------------------------------------------------------
 
 async function scoreBatch(productDesc, batch, cache) {
@@ -326,7 +333,6 @@ async function scoreBatch(productDesc, batch, cache) {
     });
   }
 
-  // Require at least half the batch scored, otherwise treat as failure
   if (byIndex.size < Math.ceil(batch.length / 2)) {
     throw new Error(`LLM returned only ${byIndex.size}/${batch.length} scores`);
   }
@@ -336,20 +342,24 @@ async function scoreBatch(productDesc, batch, cache) {
     const notice = batch[idx];
     if (byIndex.has(idx)) {
       const scored = byIndex.get(idx);
+      const tier = assignTier(scored.score);
       const key = cacheKey(productDesc, notice.noticeUrl || notice.title);
       cache[key] = {
         score: scored.score,
         reason: scored.reason,
+        tier: tier || null,
+        promptVersion: PROMPT_VERSION,
         scoredAt: new Date().toISOString()
       };
-      rows.push({
+      const row = {
         ...notice,
         score: scored.score,
         reason: scored.reason,
         status: 'scored'
-      });
+      };
+      if (tier) row.tier = tier;
+      rows.push(row);
     } else {
-      // Missing index → mark failed (do not cache)
       rows.push({
         ...notice,
         score: null,
@@ -369,6 +379,7 @@ async function scoreBatch(productDesc, batch, cache) {
 
 async function scoreNotices(productDesc, notices, cache) {
   console.log(`\n[3/4] Scoring ${notices.length} notices with LLM (batches of ${BATCH_SIZE}, ${INTER_BATCH_DELAY_MS / 1000}s between batches)…`);
+  console.log(`  Prompt version: ${PROMPT_VERSION}`);
 
   const results = [];
   const toScore = [];
@@ -377,18 +388,21 @@ async function scoreNotices(productDesc, notices, cache) {
   for (const n of notices) {
     const key = cacheKey(productDesc, n.noticeUrl || n.title);
     if (cache[key] && typeof cache[key].score === 'number') {
-      results.push({
+      const tier = assignTier(cache[key].score);
+      const row = {
         ...n,
         score: cache[key].score,
         reason: cache[key].reason,
         status: 'scored'
-      });
+      };
+      if (tier) row.tier = tier;
+      results.push(row);
     } else {
       toScore.push(n);
     }
   }
 
-  console.log(`  Cached (successful only): ${results.length} | Need scoring: ${toScore.length}`);
+  console.log(`  Cached (successful only, this prompt version): ${results.length} | Need scoring: ${toScore.length}`);
 
   async function runBatches(list, label) {
     for (let i = 0; i < list.length; i += BATCH_SIZE) {
@@ -409,7 +423,6 @@ async function scoreNotices(productDesc, notices, cache) {
       } catch (err) {
         console.error(`  Batch ${batchNum} failed after retries: ${err.message}`);
         for (const notice of batch) {
-          // status failed, score null — do NOT cache
           failed.push({
             ...notice,
             score: null,
@@ -428,20 +441,17 @@ async function scoreNotices(productDesc, notices, cache) {
 
   await runBatches(toScore, 'Scoring');
 
-  // One automatic retry pass for all failed notices
   if (failed.length > 0) {
     console.log(`\n  Retrying ${failed.length} failed notices once…`);
     await sleep(INTER_BATCH_DELAY_MS);
     const retryList = failed.map(n => {
-      // strip previous failure fields before re-scoring
-      const { score, reason, status, ...rest } = n;
+      const { score, reason, status, tier, ...rest } = n;
       return rest;
     });
     failed.length = 0;
     await runBatches(retryList, 'Retry');
   }
 
-  // Anything still in failed stays failed
   results.push(...failed);
   return results;
 }
@@ -456,34 +466,37 @@ function outputResults(scored) {
   const scoredOk = scored.filter(n => n.status === 'scored');
   const failedCount = scored.filter(n => n.status === 'failed').length;
 
-  // Sort scored first by score desc, failed at the end
   const sorted = [...scored].sort((a, b) => {
     if (a.status !== 'scored' && b.status === 'scored') return 1;
     if (a.status === 'scored' && b.status !== 'scored') return -1;
     return (b.score || 0) - (a.score || 0);
   });
 
-  const top15 = scoredOk.sort((a, b) => b.score - a.score).slice(0, 15);
+  const top15 = [...scoredOk].sort((a, b) => b.score - a.score).slice(0, 15);
   console.log(`\n=== TOP 15 SCORES (of ${scoredOk.length} successfully scored) ===`);
   if (top15.length === 0) {
     console.log('(none scored successfully)');
   } else {
     console.table(top15.map(n => ({
       Score: n.score,
-      Title: (n.title || '').slice(0, 48) + (n.title?.length > 48 ? '…' : ''),
+      Tier: n.tier || '—',
+      Title: (n.title || '').slice(0, 45) + (n.title?.length > 45 ? '…' : ''),
       Country: n.country,
       Deadline: n.deadline || '—',
-      Reason: (n.reason || '').slice(0, 55),
+      Reason: (n.reason || '').slice(0, 50),
       URL: n.noticeUrl
     })));
   }
 
-  const matches = scoredOk.filter(n => n.score >= SCORE_THRESHOLD);
-  console.log(`\n=== MATCHES (score >= ${SCORE_THRESHOLD}) — ${matches.length} ===`);
-  if (matches.length === 0) {
-    console.log('(none above threshold)');
+  const strong = scoredOk.filter(n => n.tier === 'strong').sort((a, b) => b.score - a.score);
+  const check = scoredOk.filter(n => n.tier === 'check').sort((a, b) => b.score - a.score);
+  const matches = [...strong, ...check];
+
+  console.log(`\n=== STRONG (score >= 70) — ${strong.length} ===`);
+  if (strong.length === 0) {
+    console.log('(none)');
   } else {
-    console.table(matches.map(n => ({
+    console.table(strong.map(n => ({
       Score: n.score,
       Title: (n.title || '').slice(0, 48) + (n.title?.length > 48 ? '…' : ''),
       Country: n.country,
@@ -493,27 +506,48 @@ function outputResults(scored) {
     })));
   }
 
-  const toExport = (rows) => rows.map(n => ({
-    title: n.title,
-    country: n.country,
-    deadline: n.deadline,
-    score: n.score,
-    reason: n.reason,
-    status: n.status || 'scored',
-    url: n.noticeUrl,
-    cpv: n.cpv,
-    buyerName: n.buyerName,
-    description: n.description || ''
-  }));
+  console.log(`\n=== CHECK (score 40-69) — ${check.length} ===`);
+  if (check.length === 0) {
+    console.log('(none)');
+  } else {
+    console.table(check.map(n => ({
+      Score: n.score,
+      Title: (n.title || '').slice(0, 48) + (n.title?.length > 48 ? '…' : ''),
+      Country: n.country,
+      Deadline: n.deadline || '—',
+      Reason: (n.reason || '').slice(0, 55),
+      URL: n.noticeUrl
+    })));
+  }
+
+  const toExport = (rows) => rows.map(n => {
+    const out = {
+      title: n.title,
+      country: n.country,
+      deadline: n.deadline,
+      score: n.score,
+      reason: n.reason,
+      status: n.status || 'scored',
+      url: n.noticeUrl,
+      cpv: n.cpv,
+      buyerName: n.buyerName,
+      description: n.description || ''
+    };
+    if (n.tier) out.tier = n.tier;
+    return out;
+  });
 
   saveJson(SCORED_ALL_FILE, toExport(sorted));
   saveJson(MATCHES_FILE, toExport(matches));
 
   console.log(`\n---------- SUMMARY ----------`);
+  console.log(`Prompt version              : ${PROMPT_VERSION}`);
   console.log(`Notices sent to scoring     : ${scored.length}`);
   console.log(`Successfully scored         : ${scoredOk.length}`);
   console.log(`Failed (status=failed)      : ${failedCount}`);
-  console.log(`Score >= ${SCORE_THRESHOLD} (matches)      : ${matches.length}  → matches.json`);
+  console.log(`Strong (tier)               : ${strong.length}`);
+  console.log(`Check  (tier)               : ${check.length}`);
+  console.log(`matches.json total          : ${matches.length}`);
   console.log(`All results                 : ${sorted.length}  → scored-all.json`);
 
   return matches;
@@ -527,6 +561,7 @@ async function main() {
   console.log(`Product : "${product}"`);
   console.log(`Model   : ${MODEL}`);
   console.log(`Base URL: ${BASE_URL}`);
+  console.log(`Prompt  : ${PROMPT_VERSION}`);
 
   const notices = loadJson(RESULTS_FILE, []);
   if (!Array.isArray(notices) || notices.length === 0) {
