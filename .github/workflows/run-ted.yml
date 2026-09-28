@@ -19,10 +19,12 @@ jobs:
       - name: Run TED fetcher
         run: node ted-fetch.js
 
-      - name: Upload results.json artifact
+      - name: Upload results artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ted-results
-          path: results.json
+          path: |
+            results.json
+            results-no-deadline.json
           if-no-files-found: warn
           retention-days: 7
