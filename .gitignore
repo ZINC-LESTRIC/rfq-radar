@@ -1,7 +1,10 @@
 node_modules/
 .env
 .env.*
+!.env.example
 *.log
 results.json
 results-no-deadline.json
+matches.json
+cache.json
 .DS_Store

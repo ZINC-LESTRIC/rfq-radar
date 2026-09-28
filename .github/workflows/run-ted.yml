@@ -1,10 +1,16 @@
-name: Run TED Fetcher
+name: Run TED Fetcher + Match
 
 on:
   workflow_dispatch:
+    inputs:
+      product:
+        description: 'Product description to match (e.g. leather football size 5)'
+        required: true
+        default: 'leather football size 5'
+        type: string
 
 jobs:
-  fetch-tenders:
+  fetch-and-match:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,15 +22,22 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run TED fetcher
+      - name: Fetch TED notices
         run: node ted-fetch.js
 
-      - name: Upload results artifacts
+      - name: Match product to notices
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: node match.js "${{ inputs.product }}"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ted-results
+          name: rfq-results
           path: |
             results.json
             results-no-deadline.json
+            matches.json
           if-no-files-found: warn
           retention-days: 7

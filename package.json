@@ -1,11 +1,12 @@
 {
   "name": "rfq-radar",
-  "version": "1.0.0",
-  "description": "TED EU public tender notices fetcher for sports goods and surgical instruments",
+  "version": "1.1.0",
+  "description": "TED EU tender fetcher + product matcher for Pakistani exporters",
   "main": "ted-fetch.js",
   "scripts": {
-    "start": "node ted-fetch.js",
-    "fetch": "node ted-fetch.js"
+    "fetch": "node ted-fetch.js",
+    "match": "node match.js",
+    "start": "node ted-fetch.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -15,7 +16,8 @@
     "eu",
     "tenders",
     "procurement",
-    "cpv"
+    "cpv",
+    "exporter"
   ],
   "author": "ZINC-LESTRIC",
   "license": "MIT",

@@ -6,7 +6,8 @@
  * - CPV 37400000 + 33169000 + keywords (football, sports equipment, surgical instruments)
  * - Last 30 days
  * - Deduplicated CPV codes
- * - hasDeadline flag; results.json = with deadline, results-no-deadline.json = without
+ * - hasDeadline flag; results.json = with deadline (future only), results-no-deadline.json = without
+ * - When multiple lot deadlines exist, store the LATEST; drop notices whose latest deadline is before today
  * - description-proc / description-lot when available (official field names)
  * - Node.js 18+ native fetch, no extra dependencies
  */
@@ -21,11 +22,10 @@ const path = require('path');
 // ---------------------------------------------------------------------------
 const API_URL = 'https://api.ted.europa.eu/v3/notices/search';
 const LIMIT = 250;
-const SCOPE = 'ACTIVE';           // only notices still considered active by TED
+const SCOPE = 'ACTIVE';
 const OUTPUT_WITH = path.join(__dirname, 'results.json');
 const OUTPUT_WITHOUT = path.join(__dirname, 'results-no-deadline.json');
 
-// Official field names only (from TED search field list)
 const FIELDS = [
   'publication-number',
   'notice-title',
@@ -49,7 +49,10 @@ function toTedDate(d) {
   return `${y}${m}${day}`;
 }
 
-/** Prefer English, else first available language value */
+function todayISO() {
+  return toTedDate(new Date()).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+}
+
 function extractLangText(obj) {
   if (!obj || typeof obj !== 'object') return '';
   if (typeof obj.eng === 'string') return obj.eng;
@@ -75,7 +78,6 @@ function extractBuyerName(buyerObj) {
   return [...new Set(names.filter(Boolean))].join(' / ');
 }
 
-/** Deduplicate CPV codes while preserving order */
 function dedupeCpv(arr) {
   if (!Array.isArray(arr)) return arr ? String(arr) : '';
   return [...new Set(arr.filter(Boolean))].join(', ');
@@ -85,14 +87,27 @@ function joinArr(arr) {
   return Array.isArray(arr) ? arr.filter(Boolean).join(', ') : (arr || '');
 }
 
-/** Clean date string to YYYY-MM-DD */
+/**
+ * Extract the LATEST deadline from one or more date strings.
+ * Returns YYYY-MM-DD or empty string.
+ */
+function latestDeadline(raw) {
+  if (!raw) return '';
+  const parts = Array.isArray(raw) ? raw : [raw];
+  const dates = parts
+    .map(s => String(s).split('+')[0].split('T')[0].trim())
+    .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d));
+  if (dates.length === 0) return '';
+  dates.sort(); // ISO dates sort chronologically
+  return dates[dates.length - 1]; // latest
+}
+
 function cleanDate(raw) {
   if (!raw) return '';
   const s = Array.isArray(raw) ? raw.filter(Boolean).join(', ') : String(raw);
   return s.split('+')[0].split('T')[0].trim();
 }
 
-/** Build expert query – last 30 days + CPV + keywords */
 function buildQuery() {
   const now = new Date();
   const thirtyDaysAgo = new Date(now);
@@ -180,13 +195,13 @@ async function fetchAllNotices() {
 // Transform
 // ---------------------------------------------------------------------------
 function transform(notices) {
+  const today = todayISO();
+
   return notices.map(n => {
     const pubNum = n['publication-number'] || '';
-    const deadlineRaw = n['deadline-receipt-tender-date-lot'];
-    const deadline = cleanDate(deadlineRaw);
-    const hasDeadline = Boolean(deadline && deadline.length > 0);
+    const deadline = latestDeadline(n['deadline-receipt-tender-date-lot']);
+    const hasDeadline = Boolean(deadline);
 
-    // Official description fields (prefer procedure-level, fall back to lot)
     const descProc = extractLangText(n['description-proc']);
     const descLot = extractLangText(n['description-lot']);
     const description = descProc || descLot || '';
@@ -202,12 +217,16 @@ function transform(notices) {
       noticeUrl: pubNum ? `https://ted.europa.eu/en/notice/-/detail/${pubNum}` : ''
     };
 
-    // Only include description when the API actually returned one
     if (description) {
       row.description = description;
     }
 
     return row;
+  }).filter(row => {
+    // Keep notices without deadline (go to no-deadline file)
+    if (!row.hasDeadline) return true;
+    // Drop notices whose latest deadline is already past
+    return row.deadline >= today;
   });
 }
 
@@ -245,16 +264,16 @@ async function main() {
     const withDeadline = results.filter(r => r.hasDeadline);
     const withoutDeadline = results.filter(r => !r.hasDeadline);
 
-    printTable(withDeadline, 'Notices WITH deadline (saved to results.json)');
+    printTable(withDeadline, 'Notices WITH future deadline (saved to results.json)');
     printTable(withoutDeadline, 'Notices WITHOUT deadline (saved to results-no-deadline.json)');
 
     console.log('\n---------- SUMMARY ----------');
-    console.log(`Total retrieved from API : ${results.length}`);
-    if (totalCount !== null && results.length < totalCount) {
-      console.log(`(API reported ${totalCount} total matches – pagination may have capped results)`);
+    console.log(`Total after filtering past deadlines : ${results.length}`);
+    if (totalCount !== null) {
+      console.log(`(API reported ${totalCount} total matches before local filters)`);
     }
-    console.log(`With deadline            : ${withDeadline.length}  → results.json`);
-    console.log(`Without deadline         : ${withoutDeadline.length}  → results-no-deadline.json`);
+    console.log(`With future deadline                 : ${withDeadline.length}  → results.json`);
+    console.log(`Without deadline                     : ${withoutDeadline.length}  → results-no-deadline.json`);
 
     fs.writeFileSync(OUTPUT_WITH, JSON.stringify(withDeadline, null, 2), 'utf8');
     fs.writeFileSync(OUTPUT_WITHOUT, JSON.stringify(withoutDeadline, null, 2), 'utf8');
