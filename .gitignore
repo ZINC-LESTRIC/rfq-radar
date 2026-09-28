@@ -6,5 +6,7 @@ node_modules/
 results.json
 results-no-deadline.json
 matches.json
+scored-all.json
 cache.json
+run.log
 .DS_Store

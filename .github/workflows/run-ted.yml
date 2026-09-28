@@ -29,7 +29,7 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
-        run: node match.js "${{ inputs.product }}"
+        run: node match.js "${{ inputs.product }}" 2>&1 | tee run.log
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -39,5 +39,7 @@ jobs:
             results.json
             results-no-deadline.json
             matches.json
+            scored-all.json
+            run.log
           if-no-files-found: warn
           retention-days: 7
